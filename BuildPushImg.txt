@@ -1,0 +1,70 @@
+name: ci for build and pushing the docker image
+description: This workflow is used to build and push the docker image.
+on:
+  workflow_call:
+env:
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  DOCKERHUB_KEY: ${{ secrets.DOCKER_PASSWORD }}
+jobs:
+  dev-workflow:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: useblacksmith/setup-docker-builder@v1
+      - name: Login to Dockerhub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_KEY }}
+      - name: Build and push Docker image
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_USERNAME }}/alcad-erp-api:1.0.0-dev
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+      - name: Install Vault
+        run: |
+          wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt update && sudo apt install -y vault
+      - name: Login to Vault
+        run: |
+          vault login -address="https://vault.sirpi.in" ${{ secrets.VAULT_TOKEN }}
+          vault kv get -address="https://vault.sirpi.in" -field=dev kv/projects/alcad-erp > /tmp/.env
+      - name: create SSH key file
+        run: |
+          echo "${{ secrets.BETA_SERVER_SSH_KEY}}" > /tmp/id_rsa
+          chmod 600 /tmp/id_rsa
+      - name: Login to SSDNodes server
+        run: |
+          ssh -i /tmp/id_rsa -o StrictHostKeyChecking=no ${{ secrets.BETA_SERVER_USERNAME }}@${{ secrets.BETA_SERVER_IP }} "mkdir -p ~/alerp/dev"
+          scp -i /tmp/id_rsa -o StrictHostKeyChecking=no /tmp/.env ${{ secrets.BETA_SERVER_USERNAME }}@${{ secrets.BETA_SERVER_IP }}:~/alerp/dev
+          ssh -o StrictHostKeyChecking=no -i /tmp/id_rsa ${{ secrets.BETA_SERVER_USERNAME }}@${{ secrets.BETA_SERVER_IP}} '
+            cd ~/alerp/dev
+            chmod 644 /tmp/.env
+            CONTAINER_ID=$(docker ps -aq --filter name=alerp-api-dev) 
+            IMAGE_NAME=${{ env.DOCKERHUB_USERNAME }}/alcad-erp-api:1.0.0-dev
+            echo "${{ env.DOCKERHUB_KEY }}" | docker login -u "${{ env.DOCKERHUB_USERNAME }}" --password-stdin
+            docker pull $IMAGE_NAME
+            if [ -n "$CONTAINER_ID" ]; then
+            docker stop $CONTAINER_ID && docker rm $CONTAINER_ID
+            fi
+            docker run -d -p 6001:5000 --restart=unless-stopped --env-file=.env --name=alerp-api-dev $IMAGE_NAME
+            rm ~/alerp/dev/.env
+            sleep 30 && docker logs alerp-api-dev
+          '
+      - name: Remove SSH key and .env
+        if: always()
+        run: |
+          rm -f /tmp/id_rsa
+          rm /tmp/.env
